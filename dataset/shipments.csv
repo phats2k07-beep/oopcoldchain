@@ -1,4 +1,0 @@
-shipment_id,container_id,vehicle_id,origin,destination,status,started_at
-SHP-VAC-01,CT-VAC,VH-01,Ha Noi,Da Nang,InTransit,2026-10-27T00:00:00Z
-SHP-FROZEN-01,CT-FROZEN,VH-02,Ha Noi,Hai Phong,InTransit,2026-10-27T00:00:00Z
-SHP-RISK-01,CT-RISK,VH-01,Hue,Da Nang,InTransit,2026-10-27T00:00:00Z
