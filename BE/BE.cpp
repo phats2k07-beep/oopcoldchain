@@ -365,6 +365,34 @@ public:
             return false;
         }
     }
+
+    bool getShipments(crow::json::wvalue& shipments) {
+        try {
+            connection C(connStr_);
+            work W(C);
+
+            result R = W.exec(
+                "SELECT shipment_id, status, "
+                "COALESCE(origin, ''), COALESCE(destination, '') "
+                "FROM shipments "
+                "ORDER BY created_at DESC"
+            );
+
+            int i = 0;
+            for (const auto& row : R) {
+                shipments[i]["shipment_id"] = row[0].as<string>();
+                shipments[i]["status"] = row[1].as<string>();
+                shipments[i]["origin"] = row[2].as<string>();
+                shipments[i]["destination"] = row[3].as<string>();
+                ++i;
+            }
+
+            return true;
+        } catch (const exception& e) {
+            cerr << "[USE CASE ERROR] GetShipments: " << e.what() << "\n";
+            return false;
+        }
+    }
 };
 
 //  CROW SERVER & ROUTES
@@ -460,8 +488,8 @@ int main() {
         // Kích hoạt Use Case
         appService.processSensorData(data);
 
-        // Bắn WebSocket xuống UI
-        {
+        // Chỉ gửi WebSocket khi cảm biến báo vi phạm.
+        if (data.status == "VIOLATED") {
             lock_guard<mutex> _(ws_mtx);
             for (auto client : connected_clients) {
                 client->send_text(req.body);
@@ -485,6 +513,16 @@ int main() {
             return crow::response(500, "Failed to load shipment options");
         }
         return crow::response(options);
+    });
+
+    // ROUTE 6: API GetShipments
+    CROW_ROUTE(app, "/api/shipments").methods(crow::HTTPMethod::Get)
+    ([&]() {
+        crow::json::wvalue shipments;
+        if (!appService.getShipments(shipments)) {
+            return crow::response(500, "Failed to load shipments");
+        }
+        return crow::response(shipments);
     });
 
     cout << " C++ Backend  port 8080...\n";
