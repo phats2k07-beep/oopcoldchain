@@ -1,4 +1,5 @@
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -161,6 +162,15 @@ public:
         sensors.push_back(s); 
     }
 
+    bool hasSensor(const string& sensorId) const {
+        for (const auto& sensor : sensors) {
+            if (sensor.getId() == sensorId) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     const vector<TemperatureExceededEvent>& getDomainEvents() const {
         return domainEvents;
     }
@@ -192,7 +202,7 @@ class IShipmentRepository {
 public:
     virtual ~IShipmentRepository() = default;
     virtual void save(const Shipment& shipment) = 0;
-    virtual Shipment* findById(const string& shipmentId) = 0;
+    virtual unique_ptr<Shipment> findById(const string& shipmentId) = 0;
 };
 
 // 6. DEMO (Application Layer)

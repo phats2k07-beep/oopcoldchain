@@ -1,5 +1,7 @@
 #include "crow.h"
 #include <pqxx/pqxx>
+#include <algorithm>
+#include <cctype>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -16,6 +18,31 @@
 
 using namespace std;
 using namespace pqxx;
+
+void addLocalDashboardCorsHeaders(const crow::request& request, crow::response& response) {
+    const string origin = request.get_header_value("Origin");
+    const string localPrefixes[] = {
+        "http://localhost:",
+        "http://127.0.0.1:",
+        "http://[::1]:"
+    };
+
+    for (const string& prefix : localPrefixes) {
+        if (origin.compare(0, prefix.size(), prefix) != 0) continue;
+
+        const string port = origin.substr(prefix.size());
+        if (port.empty() || port.size() > 5 ||
+            !all_of(port.begin(), port.end(), [](unsigned char ch) { return isdigit(ch); })) {
+            return;
+        }
+        const int portNumber = stoi(port);
+        if (portNumber < 1 || portNumber > 65535) return;
+
+        response.add_header("Access-Control-Allow-Origin", origin);
+        response.add_header("Vary", "Origin");
+        return;
+    }
+}
 
 #ifdef _WIN32
 extern "C" __declspec(dllimport) int __stdcall SetConsoleOutputCP(unsigned int);
@@ -77,7 +104,7 @@ public:
         }
     }
 
-    Shipment* findById(const string& id) override {
+    unique_ptr<Shipment> findById(const string& id) override {
         try {
             connection C(conn_str_);
             work W(C);
@@ -92,9 +119,8 @@ public:
             double min_t = R[0][0].as<double>();
             double max_t = R[0][1].as<double>();
 
-            // Nạp lại đối tượng (static để trả về con trỏ an toàn)
-            static Shipment loadedShipment(id, TemperatureRange(min_t, max_t));
-            loadedShipment = Shipment(id, TemperatureRange(min_t, max_t));
+            auto loadedShipment =
+                make_unique<Shipment>(id, TemperatureRange(min_t, max_t));
 
             // Nạp các device thành Sensor để recordTemperature() hoạt động
             // (DB: devices.shipment_id trỏ tới shipments.shipment_id)
@@ -103,9 +129,9 @@ public:
                 pqxx::params{id}
             );
             for (auto row : D) {
-                loadedShipment.addSensor(Sensor(row[0].as<string>(), Temperature(0.0)));
+                loadedShipment->addSensor(Sensor(row[0].as<string>(), Temperature(0.0)));
             }
-            return &loadedShipment;
+            return loadedShipment;
         } catch (const exception& e) {
             cerr << "[REPO ERROR] findById: " << e.what() << endl;
             return nullptr;
@@ -124,19 +150,19 @@ public:
     string name() const override { return "TemperatureAlertHandler"; }
 
     void onSensorData(const TelemetryData& d) override {
-        if (d.status != "VIOLATED") return;
-
-        cout << "[ALERT] Shipment " << d.shipmentId
-             << " | Device " << d.deviceId
-             << " | Temperature " << d.temperature << " C\n";
-
-        Shipment* shipment = repo_.findById(d.shipmentId);
+        auto shipment = repo_.findById(d.shipmentId);
         if (!shipment) {
             cerr << "[ALERT ERROR] Shipment not found: " << d.shipmentId << '\n';
             return;
         }
 
         TemperatureRange range = shipment->getRequiredRange();
+        if (!range.isViolated(d.temperature)) return;
+
+        cout << "[ALERT] Shipment " << d.shipmentId
+             << " | Device " << d.deviceId
+             << " | Temperature " << d.temperature << " C\n";
+
         shipment->recordTemperature(d.deviceId, d.temperature, d.timestamp);
         repo_.save(*shipment);
 
@@ -196,7 +222,7 @@ public:
     string name() const override { return "QualityEvaluator"; }
 
     void onSensorData(const TelemetryData& d) override {
-        Shipment* s = repo_.findById(d.shipmentId);
+        auto s = repo_.findById(d.shipmentId);
         if (!s) return;
 
         TemperatureRange range = s->getRequiredRange();
@@ -223,6 +249,13 @@ private:
     string connStr_;
 
 public:
+    enum class SensorDataResult {
+        Processed,
+        UnknownShipment,
+        UnknownSensor,
+        TemperatureViolation
+    };
+
     ShipmentApplicationService(IShipmentRepository& repo, SensorDataPublisher& pub, string connStr)
         : repo_(repo), publisher_(pub), connStr_(connStr) {}
 
@@ -294,13 +327,25 @@ public:
     }
 
     // USE CASE 2: ProcessSensorData (Kích hoạt Event Bus cho 3 Observers)
-    void processSensorData(const TelemetryData& data) {
+    SensorDataResult processSensorData(const TelemetryData& data) {
+        auto shipment = repo_.findById(data.shipmentId);
+        if (!shipment) return SensorDataResult::UnknownShipment;
+        if (!shipment->hasSensor(data.deviceId)) return SensorDataResult::UnknownSensor;
+
+        const bool violated =
+            shipment->getRequiredRange().isViolated(data.temperature);
         publisher_.publish(data);
+        return violated
+            ? SensorDataResult::TemperatureViolation
+            : SensorDataResult::Processed;
     }
 
     // USE CASE 3: GetShipmentTelemetry
-    crow::json::wvalue getShipmentTelemetry(const string& shipmentId) {
-        crow::json::wvalue result_json;
+    bool getShipmentTelemetry(
+        const string& shipmentId,
+        crow::json::wvalue& result_json
+    ) {
+        result_json = crow::json::wvalue::list{};
         try {
             connection C(connStr_);
             work W(C);
@@ -321,13 +366,16 @@ public:
                 result_json[i]["timestamp"]   = row[5].as<string>();
                 i++;
             }
+            return true;
         } catch (const exception& e) {
             cerr << "[USE CASE ERROR] GetShipmentTelemetry: " << e.what() << "\n";
+            return false;
         }
-        return result_json;
     }
 
     bool getShipmentOptions(crow::json::wvalue& options) {
+        options["container_types"] = crow::json::wvalue::list{};
+        options["warehouses"] = crow::json::wvalue::list{};
         try {
             connection C(connStr_);
             work W(C);
@@ -367,6 +415,7 @@ public:
     }
 
     bool getShipments(crow::json::wvalue& shipments) {
+        shipments = crow::json::wvalue::list{};
         try {
             connection C(connStr_);
             work W(C);
@@ -395,6 +444,14 @@ public:
     }
 };
 
+bool hasStringField(const crow::json::rvalue& json, const string& field) {
+    return json.has(field) && json[field].t() == crow::json::type::String;
+}
+
+bool hasNumberField(const crow::json::rvalue& json, const string& field) {
+    return json.has(field) && json[field].t() == crow::json::type::Number;
+}
+
 //  CROW SERVER & ROUTES
 int main() {
 #ifdef _WIN32
@@ -403,8 +460,26 @@ int main() {
     crow::SimpleApp app;
     // Co the ghi de chuoi ket noi bang bien moi truong COLDCHAIN_DSN
     const char* dsnEnv = getenv("COLDCHAIN_DSN");
-    string conn_str = dsnEnv ? string(dsnEnv)
-        : string("dbname=coldchain user=postgres password=phatpg hostaddr=127.0.0.1 port=5432");
+    if (!dsnEnv || *dsnEnv == '\0') {
+        cerr << "[STARTUP ERROR] Set COLDCHAIN_DSN to your PostgreSQL connection string.\n";
+        return 1;
+    }
+    string conn_str(dsnEnv);
+
+    try {
+        connection C(conn_str);
+        work W(C);
+        W.exec("SELECT 1 FROM shipments LIMIT 0");
+        W.exec("SELECT 1 FROM containers LIMIT 0");
+        W.exec("SELECT 1 FROM devices LIMIT 0");
+        W.exec("SELECT 1 FROM telemetry_readings LIMIT 0");
+        W.exec("SELECT 1 FROM temperature_alerts LIMIT 0");
+        W.commit();
+    } catch (const exception& e) {
+        cerr << "[STARTUP ERROR] PostgreSQL connection/schema check failed: "
+             << e.what() << '\n';
+        return 1;
+    }
 
     mutex ws_mtx;
     unordered_set<crow::websocket::connection*> connected_clients;
@@ -438,11 +513,13 @@ int main() {
     CROW_ROUTE(app, "/api/shipments").methods(crow::HTTPMethod::Post)
     ([&](const crow::request& req) {
         auto json = crow::json::load(req.body);
-        if (!json ||
-            !json.has("container_type") ||
-            !json.has("origin") ||
-            !json.has("destination")) {
-            return crow::response(400, "Missing container_type, origin or destination");
+        if (!json || json.t() != crow::json::type::Object) {
+            return crow::response(400, "Request body must be a JSON object");
+        }
+        if (!hasStringField(json, "container_type") ||
+            !hasStringField(json, "origin") ||
+            !hasStringField(json, "destination")) {
+            return crow::response(400, "container_type, origin and destination must be strings");
         }
 
         const string containerType = json["container_type"].s();
@@ -475,7 +552,19 @@ int main() {
     CROW_ROUTE(app, "/api/sensor-data").methods(crow::HTTPMethod::Post)
     ([&](const crow::request& req) {
         auto json = crow::json::load(req.body);
-        if (!json) return crow::response(400, "Invalid JSON");
+        if (!json || json.t() != crow::json::type::Object) {
+            return crow::response(400, "Request body must be a JSON object");
+        }
+        if (!hasStringField(json, "sensor_id") ||
+            !hasStringField(json, "shipment_id") ||
+            !hasStringField(json, "timestamp") ||
+            !hasStringField(json, "status") ||
+            !hasNumberField(json, "temperature") ||
+            !hasNumberField(json, "humidity") ||
+            (json.has("latitude") && !hasNumberField(json, "latitude")) ||
+            (json.has("longitude") && !hasNumberField(json, "longitude"))) {
+            return crow::response(400, "Sensor data contains missing or invalid fields");
+        }
 
         TelemetryData data{
             json["sensor_id"].s(), json["shipment_id"].s(),
@@ -485,11 +574,25 @@ int main() {
             json["timestamp"].s(), json["status"].s()
         };
 
-        // Kích hoạt Use Case
-        appService.processSensorData(data);
+        if (data.deviceId.empty() || data.shipmentId.empty() || data.timestamp.empty() ||
+            (data.status != "SAFE" && data.status != "VIOLATED") ||
+            !isfinite(data.temperature) || !isfinite(data.humidity) ||
+            !isfinite(data.latitude) || !isfinite(data.longitude) ||
+            data.humidity < 0.0 || data.humidity > 100.0 ||
+            data.latitude < -90.0 || data.latitude > 90.0 ||
+            data.longitude < -180.0 || data.longitude > 180.0) {
+            return crow::response(400, "Sensor data values are outside valid ranges");
+        }
 
-        // Chỉ gửi WebSocket khi cảm biến báo vi phạm.
-        if (data.status == "VIOLATED") {
+        const auto result = appService.processSensorData(data);
+        if (result == ShipmentApplicationService::SensorDataResult::UnknownShipment) {
+            return crow::response(404, "Shipment not found");
+        }
+        if (result == ShipmentApplicationService::SensorDataResult::UnknownSensor) {
+            return crow::response(404, "Sensor is not assigned to this shipment");
+        }
+
+        {
             lock_guard<mutex> _(ws_mtx);
             for (auto client : connected_clients) {
                 client->send_text(req.body);
@@ -500,9 +603,16 @@ int main() {
 
     // ROUTE 4: API GetShipmentTelemetry
     CROW_ROUTE(app, "/api/shipments/<string>/telemetry").methods(crow::HTTPMethod::Get)
-    ([&](const crow::request&, string shipmentId) {
-        auto telemetryData = appService.getShipmentTelemetry(shipmentId);
-        return crow::response(telemetryData);
+    ([&](const crow::request& req, string shipmentId) {
+        crow::json::wvalue telemetryData;
+        if (!appService.getShipmentTelemetry(shipmentId, telemetryData)) {
+            crow::response response(500, "Failed to load shipment telemetry");
+            addLocalDashboardCorsHeaders(req, response);
+            return response;
+        }
+        crow::response response(telemetryData);
+        addLocalDashboardCorsHeaders(req, response);
+        return response;
     });
 
     // ROUTE 5: API GetShipmentOptions
@@ -517,12 +627,16 @@ int main() {
 
     // ROUTE 6: API GetShipments
     CROW_ROUTE(app, "/api/shipments").methods(crow::HTTPMethod::Get)
-    ([&]() {
+    ([&](const crow::request& req) {
         crow::json::wvalue shipments;
         if (!appService.getShipments(shipments)) {
-            return crow::response(500, "Failed to load shipments");
+            crow::response response(500, "Failed to load shipments");
+            addLocalDashboardCorsHeaders(req, response);
+            return response;
         }
-        return crow::response(shipments);
+        crow::response response(shipments);
+        addLocalDashboardCorsHeaders(req, response);
+        return response;
     });
 
     cout << " C++ Backend  port 8080...\n";
